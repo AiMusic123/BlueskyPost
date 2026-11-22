@@ -13,9 +13,11 @@ POSTフォルダの Post1.txt, Post2.txt ... を1回の実行につき1件ずつ
   STATE_FILE         最後に投稿した番号を記録するファイル (デフォルト: state.json)
   LOOP               true なら最後まで投稿したら最初に戻る (デフォルト: true)
   DRY_RUN            true なら実際には投稿せず内容を表示するだけ
+  LINK_CARD          true なら本文の最初のURLをサムネ付きカードにする (デフォルト: true)
   BSKY_PDS           接続先サーバー (デフォルト: https://bsky.social)
 """
 
+import html
 import json
 import os
 import random
@@ -23,6 +25,7 @@ import re
 import sys
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -32,6 +35,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 POST_MODE = os.environ.get("POST_MODE", "sequential").lower()
 LOOP = os.environ.get("LOOP", "true").lower() == "true"
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+LINK_CARD = os.environ.get("LINK_CARD", "true").lower() == "true"
 
 MAX_GRAPHEMES = 300  # Bluesky の1投稿あたりの文字数上限
 
@@ -115,6 +119,107 @@ def build_facets(text):
     return facets
 
 
+# ---------- リンクカード（サムネ付きプレビュー） ----------
+
+UA = "Mozilla/5.0 (compatible; BlueskyPostBot/1.0; +https://bsky.app)"
+MAX_THUMB_BYTES = 950_000  # Bluesky の画像上限 (約1MB) より少し小さめ
+YT_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+
+def http_get(url, max_bytes=3_000_000):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Accept-Language": "ja,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=20) as res:
+        return res.read(max_bytes), res.headers.get("Content-Type", "")
+
+
+def _meta(html_text, key):
+    """<meta property="og:title" content="..."> のような値を取り出す"""
+    for pat in (
+        rf'<meta[^>]+(?:property|name)=["\']{re.escape(key)}["\'][^>]*content=["\']([^"\']*)["\']',
+        rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']{re.escape(key)}["\']',
+    ):
+        m = re.search(pat, html_text, re.IGNORECASE)
+        if m:
+            return html.unescape(m.group(1)).strip()
+    return ""
+
+
+def fetch_link_info(url):
+    """URL からタイトル・説明・サムネ画像URLを取得する"""
+    info = {"title": "", "description": "", "image": ""}
+
+    yt = YT_ID_RE.search(url)
+    if yt:
+        vid = yt.group(1)
+        try:
+            data, _ = http_get("https://www.youtube.com/oembed?format=json&url="
+                               + urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}", safe=""))
+            info["title"] = json.loads(data).get("title", "")
+        except Exception as e:
+            print(f"  YouTubeのタイトル取得に失敗: {e}")
+        info["image"] = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+        # 説明文はページから取れれば使う
+        try:
+            data, _ = http_get(url)
+            page = data.decode("utf-8", errors="replace")
+            info["description"] = _meta(page, "og:description")
+            info["title"] = info["title"] or _meta(page, "og:title")
+            img = _meta(page, "og:image")
+            if img:
+                info["image"] = img
+        except Exception:
+            pass
+        return info
+
+    data, ctype = http_get(url)
+    charset = "utf-8"
+    m = re.search(r"charset=([\w-]+)", ctype)
+    if m:
+        charset = m.group(1)
+    page = data.decode(charset, errors="replace")
+    info["title"] = _meta(page, "og:title") or _meta(page, "twitter:title")
+    if not info["title"]:
+        t = re.search(r"<title[^>]*>(.*?)</title>", page, re.IGNORECASE | re.DOTALL)
+        info["title"] = html.unescape(t.group(1)).strip() if t else ""
+    info["description"] = _meta(page, "og:description") or _meta(page, "description")
+    img = _meta(page, "og:image") or _meta(page, "twitter:image")
+    if img:
+        info["image"] = urllib.parse.urljoin(url, img)
+    return info
+
+
+def build_link_card(url, token):
+    """app.bsky.embed.external（リンクカード）を作る。失敗したら None"""
+    try:
+        info = fetch_link_info(url)
+    except Exception as e:
+        print(f"  リンク先の情報取得に失敗したため、カードなしで投稿します: {e}")
+        return None
+
+    external = {
+        "uri": url,
+        "title": info["title"][:300] or url,
+        "description": info["description"][:1000],
+    }
+
+    if info["image"]:
+        try:
+            img, ctype = http_get(info["image"], max_bytes=MAX_THUMB_BYTES + 1)
+            if len(img) > MAX_THUMB_BYTES:
+                print("  サムネ画像が大きすぎるため、画像なしのカードにします。")
+            else:
+                mime = ctype.split(";")[0].strip() or "image/jpeg"
+                blob = upload_blob(img, mime, token)
+                external["thumb"] = blob
+        except Exception as e:
+            print(f"  サムネ画像の取得に失敗しました: {e}")
+
+    print(f"  リンクカード: {external['title']}{' (サムネあり)' if 'thumb' in external else ''}")
+    return {"$type": "app.bsky.embed.external", "external": external}
+
+
 # ---------- Bluesky API ----------
 
 def xrpc(method, body, token=None):
@@ -134,9 +239,25 @@ def xrpc(method, body, token=None):
         raise RuntimeError(f"{method} failed: HTTP {e.code} {detail}") from None
 
 
+def upload_blob(data, mime, token):
+    req = urllib.request.Request(
+        f"{PDS}/xrpc/com.atproto.repo.uploadBlob",
+        data=data,
+        headers={"Content-Type": mime, "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            return json.loads(res.read().decode("utf-8"))["blob"]
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"uploadBlob failed: HTTP {e.code} {detail}") from None
+
+
 def post_to_bluesky(handle, app_password, text):
     session = xrpc("com.atproto.server.createSession",
                    {"identifier": handle, "password": app_password})
+    token = session["accessJwt"]
     record = {
         "$type": "app.bsky.feed.post",
         "text": text,
@@ -146,11 +267,21 @@ def post_to_bluesky(handle, app_password, text):
     facets = build_facets(text)
     if facets:
         record["facets"] = facets
+
+    # 本文の最初のURLをリンクカードにする
+    if LINK_CARD:
+        urls = [f["features"][0]["uri"] for f in facets
+                if f["features"][0]["$type"].endswith("#link")]
+        if urls:
+            card = build_link_card(urls[0], token)
+            if card:
+                record["embed"] = card
+
     return xrpc("com.atproto.repo.createRecord", {
         "repo": session["did"],
         "collection": "app.bsky.feed.post",
         "record": record,
-    }, token=session["accessJwt"])
+    }, token=token)
 
 
 # ---------- メイン ----------
